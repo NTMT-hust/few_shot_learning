@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from torch import nn
 import os
 if __name__ == '__main__':
-    dataset_path = "/kaggle/input/mcrgcn-imaged-0-1/ResultTest4/dataset"
+    dataset_path = "/kaggle/input/brca-cacnerbenchmark-withgenenamemapping/Image/Aligned_withmapping/dataset"
     
     model = StratifiedKFoldCrossValidation(
         model_name="EfficientNetB1Classifier",
