@@ -105,6 +105,8 @@ class StratifiedKFoldCrossValidation:
 
 
         for fold, (train_ids, val_ids) in enumerate(skf.split(image_paths, labels)):
+            best_val_acc = 0
+            best_fold_model = None
 
             print(f"Fold {fold+1}")
 
@@ -155,43 +157,54 @@ class StratifiedKFoldCrossValidation:
                     num_episodes=100
                 )
 
-                epoch_result = {
-                    "epoch": epoch + 1,
-                    "train_loss": train_metrics["loss"],
-                    "train_acc": train_metrics["accuracy"],
-                    "val_metrics": val_metrics
-                }
+                history["train_loss"].append(train_metrics["loss"])
+                history["train_acc"].append(train_metrics["accuracy"])
+                history["train_f1"].append(train_metrics["f1"])
+                history["train_auc"].append(train_metrics["auc"])
 
-                fold_history.append(epoch_result)
+                history["val_loss"].append(val_metrics["loss"])
+                history["val_acc"].append(val_metrics["accuracy"])
+                history["val_f1"].append(val_metrics["f1"])
+                history["val_auc"].append(val_metrics["auc"])
+                history["val_sens"].append(val_metrics["sensitivity"])
+
 
                 print(f"\nEpoch {epoch+1}")
                 print(val_metrics)
+                if val_metrics["accuracy"] > best_val_acc:
+                    best_val_acc = val_metrics["accuracy"]
+                    best_fold_model = model
 
+            torch.save(
+                best_fold_model.state_dict(),
+                f"best_model_fold_{fold+1}.pth"
+            )
 
+            print("✓ Saved best model for this fold")
                 
             fold_results.append({
                 "fold": fold + 1,
-                "history": fold_history,
-                "best_val_acc": max([e["val_acc"] for e in fold_history])
+                "history": history,
+                "best_val_acc": max(history["val_acc"])
             })
-        return fold_history
+            fold_model.append(model)
 
-def train_fewshot_epoch(model,
-                        episode_builder,
-                        optimizer,
-                        device,
-                        episodes=100):
+        return fold_results,fold_model, class_names
+
+
+def train_fewshot_epoch(model, episode_builder, optimizer, device, episodes=100):
 
     model.train()
     criterion = nn.CrossEntropyLoss()
 
     total_loss = 0
-    total_acc = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []
 
-    for e in range(episodes):
+    for _ in range(episodes):
 
-        support_x, support_y, query_x, query_y = \
-            episode_builder.sample_episode()
+        support_x, support_y, query_x, query_y = episode_builder.sample_episode()
 
         support_x = support_x.to(device)
         support_y = support_y.to(device)
@@ -199,7 +212,6 @@ def train_fewshot_epoch(model,
         query_y = query_y.to(device)
 
         logits = model(support_x, support_y, query_x)
-
         loss = criterion(logits, query_y)
 
         optimizer.zero_grad()
@@ -208,74 +220,76 @@ def train_fewshot_epoch(model,
 
         total_loss += loss.item()
 
-        preds = torch.argmax(logits, dim=1)
-        acc = (preds == query_y).float().mean()
-        total_acc += acc.item()
-        
-        # print(f"Epoch {e+1}/{episodes} | "
-        #     f"Train Loss: {total_loss/episodes:.4f} | "
-        #     f"ACC: {total_acc/episodes:.4f}")
+        probs = torch.softmax(logits, dim=1)
+        preds = torch.argmax(probs, dim=1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(query_y.cpu().numpy())
+        all_probs.extend(probs.detach().cpu().numpy())
+
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+
+    try:
+        auc = roc_auc_score(all_labels, all_probs, multi_class="ovr")
+    except:
+        auc = 0.0
 
     return {
         "loss": total_loss / episodes,
-        "accuracy": total_acc / episodes
+        "accuracy": acc,
+        "f1": f1,
+        "auc": auc
     }
 
 
-def validate_fewshot(model,
-                    episode_builder,
-                    device,
-                    num_episodes=50):
+def validate_fewshot(model, episode_builder, device, num_episodes=50):
 
     model.eval()
+    criterion = nn.CrossEntropyLoss()
 
-    acc_list = []
-    precision_list = []
-    recall_list = []
-    f1_list = []
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []
 
     with torch.no_grad():
         for _ in range(num_episodes):
 
-            support_imgs, support_labels, query_imgs, query_labels = \
-                episode_builder.sample_episode()
+            support_x, support_y, query_x, query_y = episode_builder.sample_episode()
 
-            support_imgs = support_imgs.to(device)
-            support_labels = support_labels.to(device)   # FIX
-            query_imgs = query_imgs.to(device)
-            query_labels = query_labels.to(device)
+            support_x = support_x.to(device)
+            support_y = support_y.to(device)
+            query_x = query_x.to(device)
+            query_y = query_y.to(device)
 
-            support_embeddings = model.extract_features(support_imgs)
-            query_embeddings = model.extract_features(query_imgs)
+            logits = model(support_x, support_y, query_x)
+            loss = criterion(logits, query_y)
 
-            prototypes = []
-            for c in torch.unique(support_labels):
-                prototypes.append(
-                    support_embeddings[support_labels == c].mean(0)
-                )
-            prototypes = torch.stack(prototypes)
+            total_loss += loss.item()
 
-            distances = torch.cdist(query_embeddings, prototypes)
-            preds = torch.argmin(distances, dim=1)
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
 
-            y_true = query_labels.cpu().numpy()
-            y_pred = preds.cpu().numpy()
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(query_y.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
-            acc = (preds == query_labels).float().mean().item()
-            precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
-            recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
-            f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
-            acc_list.append(acc)
-            precision_list.append(precision)
-            recall_list.append(recall)
-            f1_list.append(f1)
+    try:
+        auc = roc_auc_score(all_labels, all_probs, multi_class="ovr")
+    except:
+        auc = 0.0
+
+    cm = confusion_matrix(all_labels, all_preds)
+    sensitivity = np.mean(np.diag(cm) / (cm.sum(axis=1) + 1e-8))
 
     return {
-        "accuracy_mean": float(np.mean(acc_list)),
-        "accuracy_std": float(np.std(acc_list)),
-        "precision_macro": float(np.mean(precision_list)),
-        "recall_macro": float(np.mean(recall_list)),
-        "f1_macro": float(np.mean(f1_list)),
-        "episodes": num_episodes
+        "loss": total_loss / num_episodes,
+        "accuracy": acc,
+        "f1": f1,
+        "auc": auc,
+        "sensitivity": sensitivity
     }
