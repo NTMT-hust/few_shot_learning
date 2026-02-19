@@ -29,3 +29,6 @@ class ProtoNet(nn.Module):
         # Negative distance for softmax
         logits = -dists
         return logits
+    def extract_features(self, x):
+        return self.encoder(x)
+
